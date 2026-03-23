@@ -1,23 +1,29 @@
-from datetime import datetime
-from typing import Optional
+# =======================
+# BACKEND FASTAPI COMPLETO
+# =======================
 
-from fastapi import FastAPI, UploadFile, Form, File, HTTPException
-from sqlalchemy import create_engine, Column, Integer, String, TIMESTAMP
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from pydantic import BaseModel
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Enum
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from passlib.context import CryptContext
 import shutil
 import os
 
-# Inicializa la aplicación FastAPI
+# =======================
+# CONFIG
+# =======================
+DATABASE_URL = "mysql+pymysql://root:1n2n3m4789@localhost/entregas_paquexpress"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 app = FastAPI()
 
-# Monta la carpeta "uploads" como ruta accesible públicamente desde el navegador
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-
-# Configura el middleware CORS para permitir peticiones desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,74 +32,129 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Define la cadena de conexión a la base de datos MySQL
-DATABASE_URL = "mysql+pymysql://root:1n2n3m4789@localhost/db_practica10"
+# =======================
+# MODELOS
+# =======================
+class Usuario(Base):
+    __tablename__ = "usuario"
 
-# Crea el motor de conexión a la base de datos usando SQLAlchemy
-engine = create_engine(DATABASE_URL)
-
-# Crea una clase de sesión que se usará para interactuar con la base de datos
-SessionLocal = sessionmaker(bind=engine)
-
-# Define una base común para los modelos de base de datos
-Base = declarative_base()
-
-# Define el modelo de datos que representa la tabla 'PT8_foto'
-class Foto(Base):
-    __tablename__ = "PT8_foto"
-    
     id = Column(Integer, primary_key=True, index=True)
-    descripcion = Column(String(255), nullable=False)
-    ruta_foto = Column(String(255), nullable=False)
-    fecha = Column(TIMESTAMP, default=datetime.utcnow)
+    usr_nombre = Column(String(100))
+    usr_password = Column(String(255))
 
-# Crea las tablas en la base de datos si no existen
-Base.metadata.create_all(bind=engine)
+class Paquete(Base):
+    __tablename__ = "paquetes"
 
-# Define un esquema de validación y serialización usando Pydantic
-class FotoSchema(BaseModel):
-    id: int
-    descripcion: str
-    ruta_foto: str
-    fecha: Optional[datetime]
+    id = Column(Integer, primary_key=True, index=True)
+    pa_nombre = Column(String(100))
+    pa_descripcion = Column(String(255))
+    pa_dirOrigen = Column(String(255))
+    pa_dirDestino = Column(String(255))
+    pa_imagen = Column(String(255))
+    status = Column(Enum('asignado','recolectado','entregado'))
+    usuario_id = Column(Integer, ForeignKey("usuarios.id"))
 
-    class Config:
-        from_attributes = True
+class Entrega(Base):
+    __tablename__ = "entregas"
 
-# Define el endpoint POST para subir una foto
-@app.post("/fotos/")
-async def subir_foto(descripcion: str = Form(...), file: UploadFile = File(...)):
+    id = Column(Integer, primary_key=True, index=True)
+    paquete_id = Column(Integer, ForeignKey("paquetes.id"))
+    foto = Column(String(255))
+    latitud = Column(String(50))
+    longitud = Column(String(50))
+
+# =======================
+# DB DEPENDENCY
+# =======================
+def get_db():
     db = SessionLocal()
     try:
-        ruta = f"uploads/{file.filename}"
-        os.makedirs("uploads", exist_ok=True)
-        
-        with open(ruta, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        nueva_foto = Foto(descripcion=descripcion, ruta_foto=ruta)
-        
-        db.add(nueva_foto)
-        db.commit()
-        db.refresh(nueva_foto)
-        
-        return {
-            "msg": "Foto subida correctamente",
-            "foto": FotoSchema.from_orm(nueva_foto)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        yield db
     finally:
         db.close()
 
-@app.get("/fotos/")
-def listar_fotos():
-    try:
-        db = SessionLocal()
-        fotos = db.query(Foto).all()
-        db.close()
-        return [FotoSchema.from_orm(f) for f in fotos]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
-    finally:
-        db.close()
+# =======================
+# SEGURIDAD
+# =======================
+def hash_usr_password(usr_password: str):
+    return pwd_context.hash(usr_password)
+
+def verify_usr_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+# =======================
+# ENDPOINTS
+# =======================
+
+# REGISTRO
+@app.post("/register")
+def register(usr_nombre: str = Form(...), usr_password: str = Form(...), db: Session = Depends(get_db)):
+    hashed = hash_usr_password(usr_password)
+
+    user = Usuario(usr_nombre=usr_nombre, usr_password=hashed)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {"message": "Usuario creado"}
+
+# LOGIN
+@app.post("/login")
+def login(usr_nombre: str = Form(...), usr_password: str = Form(...), db: Session = Depends(get_db)):
+    user = db.query(Usuario).filter(Usuario.usr_nombre == usr_nombre).first()
+
+    if not user or not verify_usr_password(usr_password, user.usr_password):
+        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+
+    return {"id": user.id, "nombre": user.usr_nombre}
+
+# OBTENER PAQUETES
+@app.get("/paquetes/{user_id}")
+def get_paquetes(user_id: int, db: Session = Depends(get_db)):
+    paquetes = db.query(Paquete).filter(Paquete.usuario_id == user_id).all()
+    return paquetes
+
+# RECOLECTAR
+@app.put("/paquete/{id}/recolectar")
+def recolectar(id: int, db: Session = Depends(get_db)):
+    paquete = db.query(Paquete).get(id)
+    paquete.status = "recolectado"
+    db.commit()
+    return {"message": "Recolectado"}
+
+# ENTREGAR
+@app.put("/paquete/{id}/entregar")
+def entregar(
+    id: int,
+    latitud: str = Form(...),
+    longitud: str = Form(...),
+    foto: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    paquete = db.query(Paquete).get(id)
+
+    # Guardar pa_imagen
+    file_path = f"uploads/{foto.filename}"
+    os.makedirs("uploads", exist_ok=True)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(foto.file, buffer)
+
+    entrega = Entrega(
+        paquete_id=id,
+        foto=file_path,
+        latitud=latitud,
+        longitud=longitud
+    )
+
+    paquete.status = "entregado"
+
+    db.add(entrega)
+    db.commit()
+
+    return {"message": "Entregado correctamente"}
+
+# =======================
+# CREAR TABLAS
+# =======================
+Base.metadata.create_all(bind=engine)
